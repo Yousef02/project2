@@ -37,6 +37,103 @@ class MessengerClient:
         self.identity_key_pair = generate_eg()
         self.username = None
 
+    def _dh_ratchet(self, name: str, header: dict = None) -> None:
+        """
+        Perform a DH ratchet step.
+        
+        Inputs:
+            name: username of the other party
+            header: message header (only needed for receiving)
+        """
+        conn = self.conns[name]
+        
+        # Receiving case
+        if header is not None:
+            # Store their new DH public key
+            conn["DHr"] = header["dh_public"]
+            
+            # Derive new root key and receiving chain key
+            dh_output = compute_dh(conn["DHs"]["private"], conn["DHr"])
+            conn["RK"], conn["CKr"] = hkdf(conn["RK"], dh_output, "RACHET-STEP")
+            
+            # Generate a new DH key pair
+            conn["DHs"] = generate_eg()
+            
+            # Compute DH with our new key and their key
+            dh_output = compute_dh(conn["DHs"]["private"], conn["DHr"])
+            conn["RK"], conn["CKs"] = hkdf(conn["RK"], dh_output, "RACHET-STEP")
+            
+            # Reset message counters
+            conn["PN"] = conn["Ns"]
+            conn["Ns"] = 0
+            conn["Nr"] = 0
+            
+        # Sending case (no header)
+        else:
+            # Only perform the DH ratchet if we've received at least one message from them
+            if conn["DHr"] is not None:
+                # Generate a new DH key pair
+                conn["DHs"] = generate_eg()
+                
+                # Compute DH with our new key and their key
+                dh_output = compute_dh(conn["DHs"]["private"], conn["DHr"])
+                conn["RK"], conn["CKs"] = hkdf(conn["RK"], dh_output, "RACHET-STEP")
+                
+                # Reset message counters
+                conn["PN"] = conn["Ns"]
+                conn["Ns"] = 0
+    
+    def _symmetric_ratchet_sending(self, name: str) -> bytes:
+        """
+        Perform a symmetric ratchet step for sending.
+        
+        Inputs:
+            name: username of the other party
+            
+        Returns:
+            message_key: the key to use for encrypting the next message
+        """
+        conn = self.conns[name]
+        
+        # Ratchet the sending chain to get the next message key
+        message_key = hmac_to_aes_key(conn["CKs"], str(conn["Ns"]))
+        conn["CKs"] = hmac_to_hmac_key(conn["CKs"], "CHAIN-KEY-SENDING")
+        conn["Ns"] += 1
+        
+        return message_key
+    
+    def _symmetric_ratchet_receiving(self, name: str, msg_index: int) -> bytes:
+        """
+        Perform a symmetric ratchet step for receiving.
+        
+        Inputs:
+            name: username of the other party
+            msg_index: the index of the message to receive
+            
+        Returns:
+            message_key: the key to use for decrypting the message
+        """
+        conn = self.conns[name]
+        
+        # Check for replay attacks
+        if msg_index in conn["received_msgs"]:
+            raise Exception("Message replay detected!")
+        
+        # Add to received messages set
+        conn["received_msgs"].add(msg_index)
+        
+        # Ratchet the receiving chain to get the message key
+        ckr = conn["CKr"]
+        for i in range(msg_index - conn["Nr"]):
+            message_key = hmac_to_aes_key(ckr, str(conn["Nr"] + i))
+            ckr = hmac_to_hmac_key(ckr, "CHAIN-KEY-RECEIVING")
+        
+        # Update the receiving chain key
+        conn["CKr"] = ckr
+        conn["Nr"] = msg_index + 1
+        
+        return message_key
+
 
 
     def generate_certificate(self, username: str) -> dict:
@@ -51,6 +148,8 @@ class MessengerClient:
             certificate: dict
         """
         
+        # store the username
+        self.username = username
         # Generate the necessary ElGamal key pair for key exchanges. Public keys are are placed into a certificate to send to other clients.
         certificate = {
             "username": username,
@@ -136,7 +235,7 @@ class MessengerClient:
         # Check if we need to set up the initial sending chain
         if self.conns[name]["CKs"] is None:
             # Derive initial chain keys
-            dh_output = compute_dh(self.conns[name]["DHs"]["private"], self.certs[name])
+            dh_output = compute_dh(self.conns[name]["DH_pair"]["private"], self.certs[name])
             self.conns[name]["RK"], self.conns[name]["CKs"] = hkdf(self.conns[name]["RK"], dh_output, "INITIAL-SENDING")
 
         
@@ -156,29 +255,37 @@ class MessengerClient:
             "receiver": name
         }
 
+        '''
+        From the spec:
+        The header must include the fields “v_gov” and “c_gov” which
+        denote the outputs (v, c) of the ElGamal public key encryption. You will also need to pass an
+        “iv_gov” containing the IV used toencrypt the message key forthe government and a “receiver_iv”
+        containing the IV used to encrypt the message for the receiver.
+        '''
         # generate 2 IVs for the GCM encryption, one for the receiver and for the government
         iv_receiver = gen_random_salt()
         iv_gov = gen_random_salt()
 
         # new ElGamal pair for the government
+        dh_gov = generate_eg()
+        # Encrypt the sending chain key for the government
+        shared_secret_gov = compute_dh(dh_gov["private"], self.gov_public_key)
+        shared_secret_gov = hmac_to_aes_key(shared_secret_gov, gov_encryption_data_str)
+        gov_ciphertext_info = encrypt_with_gcm(shared_secret_gov, message_key, iv_gov)
+
+        # Add the government's info to the header
+        header["v_gov"] = dh_gov["public"]
+        header["c_gov"] = gov_ciphertext_info
+        header["iv_gov"] = iv_gov
+        header["receiver_iv"] = iv_receiver
+
+        # Encrypt the message
+        ciphertext_info = encrypt_with_gcm(message_key, plaintext, iv_receiver, str(header))
+
+        # return the header and the ciphertext
+        return header, ciphertext_info
 
 
-
-
-
-
-
-
-
-        
-
-
-
-
-
-        # header = {}
-        # ciphertext = ""
-        # return header, ciphertext
 
 
     def receive_message(self, name: str, message: tuple[dict, tuple[bytes, bytes]]) -> str:
@@ -192,7 +299,109 @@ class MessengerClient:
         Returns:
             plaintext: str
         """
-        raise NotImplementedError("not implemented!")
         header, ciphertext = message
-        plaintext = ""
+    
+        if header["receiver"] != self.username:
+            raise Exception("Message not intended for this recipient")
+        
+        # Initialize the connection if this is the first message
+        first_message = name not in self.conns
+        if first_message:
+            self.conns[name] = {
+                "DH_pair": self.identity_key_pair,
+                "DH_receiver": header["dh_public"],
+                "RK" : None, # root key
+                "CKs" : None, # chain key sending
+                "CKr" : None, # chain key receiving
+                "Ns" : 0, # message number sending
+                "Nr" : 0, # message number receiving
+                "PNs" : 0, # # Number of messages in previous sending chain
+                "received_messages" : set() # set of received messages to prevent replay attacks
+            }
+
+        conn = self.conns[name]
+
+        # Check if this is the first message or if the DH ratchet needs to be updated
+        if conn["DH_receiver"] is None or header["dh_public"] != conn["DH_receiver"]:
+            # Perform a DH ratchet step
+
+            # store their new public key
+            conn["DH_receiver"] = header["dh_public"]
+
+            # Derive new root key and receiving chain key
+            dh_output = compute_dh(conn["DH_pair"]["private"], conn["DH_receiver"])
+            conn["RK"], conn["CKr"] = hkdf(conn["RK"], dh_output, "RACHET-STEP")
+
+            # Generate a new DH key pair for future sending
+            conn["DH_pair"] = generate_eg()
+            dh_output = compute_dh(conn["DH_pair"]["private"], conn["DH_receiver"])
+            conn["RK"], conn["CKs"] = hkdf(conn["RK"], dh_output, "RACHET-STEP")
+
+            # Reset message counters
+            conn["PNs"] = conn["Ns"]
+            conn["Ns"] = 0
+            conn["Nr"] = 0
+        
+        # Generate the message key
+        if header["message_number"] in conn["received_messages"]:
+            raise Exception("Message replay detected!")
+        
+        conn["received_messages"].add(header["message_number"])
+
+        # Ratchet the receiving chain to get the message key
+        ckr = conn["CKr"]
+        for i in range(header["message_number"] - conn["Nr"]):
+            message_key = hmac_to_aes_key(ckr, str(conn["Nr"] + i))
+            ckr = hmac_to_hmac_key(ckr, "CHAIN-KEY-RECEIVING")
+
+        # Update the receiving chain key
+        conn["CKr"] = ckr
+        conn["Nr"] = header["message_number"] + 1
+
+        # Decrypt the message
+        plaintext = decrypt_with_gcm(message_key, ciphertext, header["receiver_iv"], str(header))
+
         return plaintext
+    
+
+
+
+
+
+
+
+
+
+
+
+        # if first_message:
+        #     self._initialize_ratchet(name, False)
+        
+        # conn = self.conns[name]
+        
+        # # Special handling for the first message
+        # if first_message:
+        #     # Use our identity key to derive the initial root key
+        #     conn["DHr"] = header["dh_public"]
+        #     shared_secret = compute_dh(self.identity_key_pair["private"], conn["DHr"])
+        #     conn["RK"] = shared_secret
+            
+        #     # Derive the initial receiving chain key
+        #     dh_output = compute_dh(self.identity_key_pair["private"], conn["DHr"])
+        #     conn["RK"], conn["CKr"] = hkdf(conn["RK"], dh_output, "INITIAL-RECEIVING")
+            
+        #     # Then perform the standard DH ratchet step to prepare for future messages
+        #     self._dh_ratchet(name, header)
+        
+        # # Normal handling for subsequent messages
+        # elif conn["DHr"] is None or header["dh_public"] != conn["DHr"]:
+        #     # We need to perform a DH ratchet
+        #     self._dh_ratchet(name, header)
+        
+        # # Generate the message key
+        # message_key = self._symmetric_ratchet_receiving(name, header["ns"])
+        
+        # # Decrypt the message
+        # plaintext = decrypt_with_gcm(message_key, ciphertext, header["receiver_iv"], str(header))
+        
+        # return plaintext
